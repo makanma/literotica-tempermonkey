@@ -1,0 +1,464 @@
+// ==UserScript==
+// @name         Literotica Downloader 2025 (v1.2 — Total Garbage Removal)
+// @namespace    ld
+// @version      1.2
+// @description  Perfect clean HTML downloads. Removes ALL promo, UI, games, models, banners, slugs.
+// @match        https://www.literotica.com/*
+// @grant        GM_download
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+"use strict";
+
+////////////////////////////////////////////////////////////
+// CONFIG
+////////////////////////////////////////////////////////////
+
+const PAGE_WIDTH = "50%";
+const BACKGROUND = "#111";
+const TEXT_COLOR = "#eee";
+const FONT_SIZE  = "1.2em";
+
+const filenameSanitize = /[\\\/:*?"<>|]/g;
+
+////////////////////////////////////////////////////////////
+// HELPERS
+////////////////////////////////////////////////////////////
+
+function $(s, r=document){ return r.querySelector(s); }
+function $$(s, r=document){ return Array.from(r.querySelectorAll(s)); }
+const wait = ms => new Promise(r => setTimeout(r, ms));
+
+////////////////////////////////////////////////////////////
+// LOAD PAGE VIA IFRAME (WAF-SAFE)
+////////////////////////////////////////////////////////////
+
+function loadDoc(url){
+    return new Promise((resolve,reject)=>{
+        const f = document.createElement("iframe");
+        f.style.display="none";
+        f.src=url;
+
+        f.onload = ()=>{
+            try{
+                const doc = f.contentDocument;
+                if(!doc) throw new Error("no contentDocument");
+                resolve(doc);
+            }catch(e){ reject(e); }
+            finally{ f.remove(); }
+        };
+
+        f.onerror = ()=>{ f.remove(); reject("iframe load error"); };
+        document.body.appendChild(f);
+    });
+}
+
+////////////////////////////////////////////////////////////
+// FOOTER BLOCK ELEMENTS
+////////////////////////////////////////////////////////////
+
+function removeFooterBlocks(doc){
+    const selectors = [
+        'div[class^="_story_page__footer_"]',
+        'div[class^="_story_page__bottom_bar_"]',
+        'div[class^="_story_page__app_promo_"]',
+        'footer',
+        'div[class*="footer"]'
+    ];
+    doc.querySelectorAll(selectors.join(",")).forEach(el => el.remove());
+}
+
+////////////////////////////////////////////////////////////
+// STORY CONTAINER
+////////////////////////////////////////////////////////////
+
+function findStoryContainer(doc){
+    let c = doc.querySelector('div[class^="_story_page__text_"]');
+    if (c) return c;
+
+    const old = [
+        ".b-story-body-x", ".b-story-body",
+        ".b-story-body__text", ".paragraphs-container",
+        "[itemprop='articleBody']", ".story-body",
+        "[class*='story-body']", "article"
+    ];
+    for(const s of old){
+        const el = doc.querySelector(s);
+        if(el) return el;
+    }
+    return doc.body;
+}
+
+////////////////////////////////////////////////////////////
+// INLINE SANITIZER (allow only inline formatting)
+////////////////////////////////////////////////////////////
+
+function cleanParagraphHTML(rawHTML){
+    const tmp = document.createElement("div");
+    tmp.innerHTML = rawHTML;
+
+    const allowedInline = new Set(["B","STRONG","I","EM","BR"]);
+
+    function sanitize(node){
+        if(!node) return;
+        if(node.nodeType === Node.ELEMENT_NODE){
+            const tag = node.tagName;
+            if(!allowedInline.has(tag)){
+                const parent = node.parentNode;
+                if(parent){
+                    while(node.firstChild){
+                        parent.insertBefore(node.firstChild, node);
+                    }
+                    parent.removeChild(node);
+                    return;
+                }
+            } else {
+                [...node.attributes].forEach(a=>node.removeAttribute(a.name));
+            }
+        }
+        let c=node.firstChild;
+        while(c){
+            const n=c.nextSibling;
+            sanitize(c);
+            c=n;
+        }
+    }
+
+    sanitize(tmp);
+    return tmp.innerHTML.trim();
+}
+
+////////////////////////////////////////////////////////////
+// SOFT TEXT REMOVAL
+////////////////////////////////////////////////////////////
+
+const FOOTER_PATTERNS = [
+    /All contents/i,
+    /Copyright/i,
+    /registered trademark/i,
+    /Reproduction prohibited/i,
+    /Characters in all stories are over/i,
+    /DMCA/i,
+    /2257/i,
+    /Version \d/i,
+    /font size/i,
+    /font face/i,
+    /dark mode/i,
+    /Story Info Box/i,
+    /Classic Literotica/i,
+    /Beta testing/i,
+    /update is live/i,
+    /suggest improvements/i,
+    /Similar Stories/i,
+    /Leave a comment/i,
+    /Comments/i,
+    /Author.*profile/i,
+    /By clicking/i,
+    /Read more/i,
+    /Switch back/i,
+    /Log in/i
+];
+
+function softRemoveFooterText(str){
+    let out = str;
+
+    FOOTER_PATTERNS.forEach(p=>{
+        out = out.replace(p, "");
+    });
+
+    out = out
+      .replace(/<!--.*?-->/g, "")
+      .replace(/\[\s*\]/g, "")
+      .trim();
+
+    return out;
+}
+
+////////////////////////////////////////////////////////////
+// HARD PARAGRAPH REMOVAL LIST (NEW)
+////////////////////////////////////////////////////////////
+// These kill every garbage line found in your uploaded file.
+
+const BAD_PARAGRAPH_REGEX = [
+    /^[A-Za-z0-9_]+$/,            // single word usernames
+    /^[A-Za-z0-9_-]+$/,           // game slugs (sex-idler, animal-cafe)
+    /^[a-z0-9-]+$/i,              // another slug variation
+    /Models Online Now/i,
+    /Swipe to see more Adult Games/i,
+    /Adult Games/i,
+    /Games/i,
+    /font settings/i,
+    /update is live/i,
+    /Switch back to Classic/i,
+    /Help us make Literotica/i,
+    /feedback/i,
+    /Author Profiles/i,
+    /Promo/i
+];
+
+////////////////////////////////////////////////////////////
+// EXTRACT STORY TEXT
+////////////////////////////////////////////////////////////
+
+function buildStoryContentFromDoc(doc){
+    removeFooterBlocks(doc);
+
+    const cont = findStoryContainer(doc);
+    if(!cont) return "";
+
+    // Remove non-story blocks
+    const badBlocks = [
+        'div[class*="_promo_"]',
+        'div[class*="_toolbar_"]',
+        'div[class*="_actions_"]',
+        'div[class*="_info_"]',
+        'div[class*="_footer_"]',
+        'div[class*="_bottom_"]',
+        'div[class*="comments"]',
+        'div[class*="rating"]',
+        'div[class*="bookmark"]',
+        'div[class*="share"]',
+        'div[class*="social"]',
+        'section',
+        'aside'
+    ];
+    badBlocks.forEach(sel=>{
+        cont.querySelectorAll(sel).forEach(n=>n.remove());
+    });
+
+    // HARD DELETE unwanted paragraphs
+    cont.querySelectorAll("p").forEach(p=>{
+        const t = p.textContent.trim();
+        for(const regex of BAD_PARAGRAPH_REGEX){
+            if(regex.test(t)){
+                p.remove();
+                return;
+            }
+        }
+    });
+
+    // Paragraphs
+    let paras = cont.querySelectorAll('div[class^="_paragraph_"]');
+    if(!paras.length){
+        paras = cont.querySelectorAll("p");
+    }
+
+    let out = "";
+    paras.forEach(pDiv=>{
+        let clean = cleanParagraphHTML(pDiv.innerHTML);
+        clean = softRemoveFooterText(clean);
+
+        if(clean.length > 0 && clean.replace(/&nbsp;|\s+/g,"").length > 0){
+            out += `<p>${clean}</p>`;
+        }
+    });
+
+    return out;
+}
+
+////////////////////////////////////////////////////////////
+// MULTIPAGE LOADER
+////////////////////////////////////////////////////////////
+
+function findNextPage(doc){
+    let a = doc.querySelector(".b-pager-next a");
+    if(a?.href) return a.href;
+
+    a = doc.querySelector("a.b-pager-next");
+    if(a?.href) return a.href;
+
+    a = doc.querySelector("a[rel='next']");
+    if(a?.href) return a.href;
+
+    const icon = doc.querySelector("a[href*='?page='] i.icon-angle-right");
+    if(icon){
+        const link = icon.closest("a");
+        if(link?.href) return link.href;
+    }
+
+    const links = doc.querySelectorAll("a[href*='?page=']");
+    for(const link of links){
+        const t = (link.textContent||"").trim().toLowerCase();
+        if(t.startsWith("next")) return link.href;
+    }
+
+    return null;
+}
+
+async function extractFullStory(url, visited={}, page=1){
+    if(visited[url]) return "";
+    visited[url] = true;
+
+    const doc = await loadDoc(url);
+    const content = buildStoryContentFromDoc(doc);
+
+    const next = findNextPage(doc);
+    if(next){
+        const extra = await extractFullStory(next, visited, page+1);
+        return content + `<hr><h2>Page ${page+1}</h2><hr>` + extra;
+    }
+    return content;
+}
+
+////////////////////////////////////////////////////////////
+// HTML WRAPPER
+////////////////////////////////////////////////////////////
+
+function wrapHTML(title, content){
+return `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>${title}</title>
+<style>
+body{max-width:${PAGE_WIDTH};margin:auto;background:${BACKGROUND};color:${TEXT_COLOR};
+font-size:${FONT_SIZE};line-height:1.6;padding:20px;}
+h1{text-align:center;margin-bottom:1em;}
+h2{text-align:center;margin:1.5em 0 1em;}
+hr{border:0;border-top:1px solid #555;margin:2em 0;}
+p{margin:1em 0;}
+</style>
+</head>
+<body>
+<h1>${title}</h1>
+${content}
+</body>
+</html>`;
+}
+
+////////////////////////////////////////////////////////////
+// STORY / SERIES SELECTORS
+////////////////////////////////////////////////////////////
+
+function storyFromCard(card){
+    let a=card.querySelector("a[href*='/s/']");
+    if(!a) a=card.querySelector("a[class*='_item_title_']");
+    if(!a) return null;
+
+    return {
+        title: a.textContent.trim(),
+        url: a.href
+    };
+}
+
+function seriesInfoFromHeader(header){
+    const tA=header.querySelector("a[class*='_item_title_']");
+    const title = tA ? tA.textContent.trim() : "Series";
+
+    const wrap = header.closest("div[class*='_works_wrapper_']") || document;
+    const parts = [...wrap.querySelectorAll("div[class*='_series_parts__item__series_part_card_']")]
+        .map(storyFromCard).filter(Boolean);
+
+    return { title, parts };
+}
+
+////////////////////////////////////////////////////////////
+// DOWNLOAD FUNCTIONS
+////////////////////////////////////////////////////////////
+
+async function downloadStory(card){
+    const info = storyFromCard(card);
+    if(!info) return;
+
+    const content = await extractFullStory(info.url);
+    const html = wrapHTML(info.title, content);
+
+    GM_download({
+        name: info.title.replace(filenameSanitize,"_")+".html",
+        url: URL.createObjectURL(new Blob([html], {type:"text/html"}))
+    });
+}
+
+async function downloadSeries(header){
+    const info = seriesInfoFromHeader(header);
+    if(!info || !info.parts.length){
+        alert("Series has no parts.");
+        return;
+    }
+
+    let combined = "";
+    for(let i=0;i<info.parts.length;i++){
+        const p=info.parts[i];
+        const content = await extractFullStory(p.url);
+        combined += `<h2>Part ${i+1}: ${p.title}</h2>${content}<hr>`;
+        await wait(50);
+    }
+
+    const html = wrapHTML(info.title, combined);
+
+    GM_download({
+        name: info.title.replace(filenameSanitize,"_")+"_series.html",
+        url: URL.createObjectURL(new Blob([html], {type:"text/html"}))
+    });
+}
+
+////////////////////////////////////////////////////////////
+// CONTEXT MENU (Ctrl + Right Click)
+////////////////////////////////////////////////////////////
+
+const menu=document.createElement("div");
+menu.style.position="absolute";
+menu.style.zIndex="999999";
+menu.style.background="#222";
+menu.style.color="#eee";
+menu.style.border="1px solid #555";
+menu.style.padding="4px 0";
+menu.style.fontSize="13px";
+menu.style.minWidth="190px";
+menu.style.display="none";
+document.body.appendChild(menu);
+
+function hideMenu(){
+    menu.style.display="none";
+    menu.innerHTML="";
+}
+document.addEventListener("click", hideMenu);
+
+function addMenuItem(label, fn){
+    const d=document.createElement("div");
+    d.textContent=label;
+    d.style.padding="4px 12px";
+    d.style.cursor="pointer";
+    d.addEventListener("mouseover",()=>d.style.background="#444");
+    d.addEventListener("mouseout",()=>d.style.background="transparent");
+    d.addEventListener("click",e=>{e.stopPropagation();hideMenu();fn();});
+    menu.appendChild(d);
+}
+
+document.addEventListener("contextmenu", e => {
+    if(!e.ctrlKey) return;
+
+    const seriesHeader = e.target.closest("div[class*='_works_item__series_expanded_header_card_']");
+    const seriesPart   = e.target.closest("div[class*='_series_parts__item__series_part_card_']");
+    let storyCard      = null;
+
+    if(seriesPart) storyCard=seriesPart;
+    else if(!seriesHeader) storyCard=e.target.closest("div[class^='_works_item_']");
+
+    if(!seriesHeader && !seriesPart && !storyCard) return;
+
+    e.preventDefault();
+    hideMenu();
+
+    if(seriesHeader && !seriesPart){
+        addMenuItem("📚 Download Series", () => downloadSeries(seriesHeader));
+    }
+    else if(seriesPart){
+        addMenuItem("📥 Download This Story", () => downloadStory(seriesPart));
+        const header=seriesPart.closest("div[class*='_works_wrapper_']")
+                     ?.querySelector("div[class*='_works_item__series_expanded_header_card_']");
+        if(header)
+            addMenuItem("📚 Download Entire Series", () => downloadSeries(header));
+    }
+    else if(storyCard){
+        addMenuItem("📥 Download Story", () => downloadStory(storyCard));
+    }
+
+    menu.style.left = e.pageX+"px";
+    menu.style.top  = e.pageY+"px";
+    menu.style.display="block";
+});
+
+})();
