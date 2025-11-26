@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Literotica Downloader 2025 (v1.2 — Total Garbage Removal)
+// @name         Literotica Downloader 2025 (v1.4 — Author Filenames + Fixed Series Scope)
 // @namespace    ld
-// @version      1.2
-// @description  Perfect clean HTML downloads. Removes ALL promo, UI, games, models, banners, slugs.
+// @version      1.4
+// @description  Perfect clean HTML downloads. Removes ALL promo/UI/junk. Ctrl+RightClick on cards. Series download is correctly scoped, filenames include author.
 // @match        https://www.literotica.com/*
 // @grant        GM_download
 // @run-at       document-end
@@ -15,12 +15,13 @@
 // CONFIG
 ////////////////////////////////////////////////////////////
 
-const PAGE_WIDTH = "50%";
-const BACKGROUND = "#111";
-const TEXT_COLOR = "#eee";
-const FONT_SIZE  = "1.2em";
+const PAGE_WIDTH  = "50%";
+const BACKGROUND  = "#111";
+const TEXT_COLOR  = "#eee";
+const FONT_SIZE   = "1.2em";
 
 const filenameSanitize = /[\\\/:*?"<>|]/g;
+const safeName = s => (s || "Unknown").replace(filenameSanitize, "_");
 
 ////////////////////////////////////////////////////////////
 // HELPERS
@@ -114,6 +115,7 @@ function cleanParagraphHTML(rawHTML){
                     return;
                 }
             } else {
+                // strip all attributes
                 [...node.attributes].forEach(a=>node.removeAttribute(a.name));
             }
         }
@@ -176,14 +178,14 @@ function softRemoveFooterText(str){
 }
 
 ////////////////////////////////////////////////////////////
-// HARD PARAGRAPH REMOVAL LIST (NEW)
+// HARD PARAGRAPH REMOVAL LIST
 ////////////////////////////////////////////////////////////
-// These kill every garbage line found in your uploaded file.
+// These kill every garbage line found in previous downloaded files.
 
 const BAD_PARAGRAPH_REGEX = [
     /^[A-Za-z0-9_]+$/,            // single word usernames
     /^[A-Za-z0-9_-]+$/,           // game slugs (sex-idler, animal-cafe)
-    /^[a-z0-9-]+$/i,              // another slug variation
+    /^[a-z0-9-]+$/i,              // generic slug variation
     /Models Online Now/i,
     /Swipe to see more Adult Games/i,
     /Adult Games/i,
@@ -207,7 +209,7 @@ function buildStoryContentFromDoc(doc){
     const cont = findStoryContainer(doc);
     if(!cont) return "";
 
-    // Remove non-story blocks
+    // Remove obvious non-story blocks
     const badBlocks = [
         'div[class*="_promo_"]',
         'div[class*="_toolbar_"]',
@@ -332,26 +334,48 @@ ${content}
 // STORY / SERIES SELECTORS
 ////////////////////////////////////////////////////////////
 
+// Extract story info from a card on the author/series list page
 function storyFromCard(card){
-    let a=card.querySelector("a[href*='/s/']");
-    if(!a) a=card.querySelector("a[class*='_item_title_']");
+    let a = card.querySelector("a[href*='/s/']");
+    if(!a) a = card.querySelector("a[class*='_item_title_']");
     if(!a) return null;
+
+    const authorA = card.querySelector('a[href*="/authors/"]');
+    const author  = authorA ? authorA.textContent.trim() : "";
 
     return {
         title: a.textContent.trim(),
-        url: a.href
+        url: a.href,
+        author
     };
 }
 
+// Find the specific series parts wrapper that belongs to this header
+function findSeriesPartsContainer(header){
+    let node = header.nextElementSibling;
+    while(node){
+        if(node.matches && node.matches("div[class*='_series_parts__wrapper_']")){
+            return node;
+        }
+        node = node.nextElementSibling;
+    }
+    return null;
+}
+
+// Extract series info (title, author, parts) from a header card
 function seriesInfoFromHeader(header){
-    const tA=header.querySelector("a[class*='_item_title_']");
+    const tA = header.querySelector("a[class*='_item_title_']");
     const title = tA ? tA.textContent.trim() : "Series";
 
-    const wrap = header.closest("div[class*='_works_wrapper_']") || document;
-    const parts = [...wrap.querySelectorAll("div[class*='_series_parts__item__series_part_card_']")]
-        .map(storyFromCard).filter(Boolean);
+    const authorA = header.querySelector('a[href*="/authors/"]');
+    const author  = authorA ? authorA.textContent.trim() : "";
 
-    return { title, parts };
+    const wrap = findSeriesPartsContainer(header) || header.ownerDocument;
+    const parts = [...wrap.querySelectorAll("div[class*='_series_parts__item__series_part_card_']")]
+        .map(storyFromCard)
+        .filter(Boolean);
+
+    return { title, author, parts };
 }
 
 ////////////////////////////////////////////////////////////
@@ -365,8 +389,11 @@ async function downloadStory(card){
     const content = await extractFullStory(info.url);
     const html = wrapHTML(info.title, content);
 
+    const safeTitle  = safeName(info.title);
+    const safeAuthor = safeName(info.author);
+
     GM_download({
-        name: info.title.replace(filenameSanitize,"_")+".html",
+        name: `${safeTitle} - ${safeAuthor}.html`,
         url: URL.createObjectURL(new Blob([html], {type:"text/html"}))
     });
 }
@@ -380,7 +407,7 @@ async function downloadSeries(header){
 
     let combined = "";
     for(let i=0;i<info.parts.length;i++){
-        const p=info.parts[i];
+        const p = info.parts[i];
         const content = await extractFullStory(p.url);
         combined += `<h2>Part ${i+1}: ${p.title}</h2>${content}<hr>`;
         await wait(50);
@@ -388,8 +415,11 @@ async function downloadSeries(header){
 
     const html = wrapHTML(info.title, combined);
 
+    const safeTitle  = safeName(info.title);
+    const safeAuthor = safeName(info.author);
+
     GM_download({
-        name: info.title.replace(filenameSanitize,"_")+"_series.html",
+        name: `${safeTitle} - series - ${safeAuthor}.html`,
         url: URL.createObjectURL(new Blob([html], {type:"text/html"}))
     });
 }
@@ -432,10 +462,13 @@ document.addEventListener("contextmenu", e => {
 
     const seriesHeader = e.target.closest("div[class*='_works_item__series_expanded_header_card_']");
     const seriesPart   = e.target.closest("div[class*='_series_parts__item__series_part_card_']");
-    let storyCard      = null;
+    let   storyCard    = null;
 
-    if(seriesPart) storyCard=seriesPart;
-    else if(!seriesHeader) storyCard=e.target.closest("div[class^='_works_item_']");
+    if(seriesPart) {
+        storyCard = seriesPart;
+    } else if(!seriesHeader) {
+        storyCard = e.target.closest("div[class^='_works_item_']");
+    }
 
     if(!seriesHeader && !seriesPart && !storyCard) return;
 
@@ -447,8 +480,9 @@ document.addEventListener("contextmenu", e => {
     }
     else if(seriesPart){
         addMenuItem("📥 Download This Story", () => downloadStory(seriesPart));
-        const header=seriesPart.closest("div[class*='_works_wrapper_']")
-                     ?.querySelector("div[class*='_works_item__series_expanded_header_card_']");
+        const header = findSeriesPartsContainer(seriesPart.closest("div[class*='_series_parts__wrapper_']"))
+                     ? seriesPart.closest("div[class*='_series_parts__wrapper_']").previousElementSibling
+                     : seriesPart.closest("div[class*='_works_wrapper_']")?.querySelector("div[class*='_works_item__series_expanded_header_card_']");
         if(header)
             addMenuItem("📚 Download Entire Series", () => downloadSeries(header));
     }
