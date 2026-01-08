@@ -1,1 +1,1 @@
-CTRL + right click
+Ctrl+RightClick on cards
